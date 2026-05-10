@@ -1,0 +1,444 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Criar estrutura do projeto
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force src
+          
+          $package = @'
+          {
+            "name": "brasilxmaster-bridge",
+            "version": "1.0.0",
+            "main": "src/main.js",
+            "homepage": "./",
+            "scripts": {
+              "start": "electron .",
+              "dev": "electron .",
+              "build": "electron-builder --win --publish never"
+            },
+            "dependencies": {
+              "express": "^4.18.3",
+              "cors": "^2.8.5",
+              "serialport": "^9.2.8",
+              "usb": "^1.11.0",
+              "dotenv": "^16.4.5"
+            },
+            "devDependencies": {
+              "electron": "^27.0.0",
+              "electron-builder": "^24.6.4"
+            },
+            "build": {
+              "appId": "com.brasilxmaster.bridge",
+              "productName": "BrasilXMaster-Bridge",
+              "directories": {
+                "buildResources": "assets"
+              },
+              "files": [
+                "src/**/*",
+                "package.json"
+              ],
+              "win": {
+                "target": [
+                  {
+                    "target": "portable",
+                    "arch": [
+                      "x64"
+                    ]
+                  }
+                ]
+              }
+            }
+          }
+          '@
+          $package | Out-File package.json -Encoding utf8
+
+      - name: Criar .env
+        shell: powershell
+        run: |
+          @'
+          PORT=9999
+          SITE_URL=https://brasilxmaster.com.br
+          '@ | Out-File .env -Encoding utf8
+
+      - name: Criar main.js
+        shell: powershell
+        run: |
+          $code = @'
+/* eslint-disable no-undef */
+require("dotenv").config();
+
+const { app, BrowserWindow } = require("electron");
+const express = require("express");
+const cors = require("cors");
+const fs = require("fs");
+const { exec } = require("child_process");
+const { SerialPort } = require("serialport");
+const usb = require("usb");
+
+const SITE_URL = process.env.SITE_URL || "https://brasilxmaster.com.br";
+const PORT = Number(process.env.PORT || 9999);
+
+let mainWindow = null;
+let activePort = null;
+
+function runCommand(command) {
+  return new Promise((resolve) => {
+    exec(command, { windowsHide: true }, (error, stdout, stderr) => {
+      resolve({
+        ok: !error,
+        stdout: stdout || "",
+        stderr: stderr || "",
+        error: error ? error.message : null
+      });
+    });
+  });
+}
+
+async function listSerialPorts() {
+  try {
+    const ports = await SerialPort.list();
+    return ports.map(p => ({
+      path: p.path,
+      manufacturer: p.manufacturer || "",
+      serialNumber: p.serialNumber || "",
+      vendorId: p.vendorId || "",
+      productId: p.productId || "",
+      pnpId: p.pnpId || "",
+      friendlyName: p.friendlyName || ""
+    }));
+  } catch (err) {
+    return [];
+  }
+}
+
+function listUsbDevices() {
+  try {
+    const devices = usb.getDeviceList();
+    return devices.map(d => ({
+      busNumber: d.busNumber || null,
+      deviceAddress: d.deviceAddress || null,
+      vendorId: d.deviceDescriptor ? "0x" + d.deviceDescriptor.idVendor.toString(16).padStart(4, "0") : "",
+      productId: d.deviceDescriptor ? "0x" + d.deviceDescriptor.idProduct.toString(16).padStart(4, "0") : "",
+      manufacturer: "",
+      product: ""
+    }));
+  } catch (err) {
+    return [];
+  }
+}
+
+function detectDrives() {
+  const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("");
+  const drives = [];
+  for (const letter of letters) {
+    const drive = letter + ":\\";
+    try {
+      if (fs.existsSync(drive)) {
+        drives.push({ drive, available: true });
+      }
+    } catch (err) {}
+  }
+  return drives;
+}
+
+async function detectJ2534() {
+  const keys = [
+    "HKLM\\SOFTWARE\\PassThruSupport.04.04",
+    "HKLM\\SOFTWARE\\WOW6432Node\\PassThruSupport.04.04"
+  ];
+  const devices = [];
+
+  for (const key of keys) {
+    const result = await runCommand("reg query " + JSON.stringify(key) + " /s");
+    if (result.ok && result.stdout) {
+      const lines = result.stdout.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+      let current = null;
+
+      for (const line of lines) {
+        if (line.startsWith("HKEY_")) {
+          if (current) devices.push(current);
+          current = {
+            registryKey: line,
+            name: line.split("\\").pop(),
+            functionLibrary: "",
+            vendor: ""
+          };
+        } else if (current && line.toLowerCase().includes("functionlibrary")) {
+          const parts = line.split(/\s{2,}/);
+          current.functionLibrary = parts[parts.length - 1] || "";
+        } else if (current && line.toLowerCase().includes("name")) {
+          const parts = line.split(/\s{2,}/);
+          current.name = parts[parts.length - 1] || current.name;
+        } else if (current && line.toLowerCase().includes("vendor")) {
+          const parts = line.split(/\s{2,}/);
+          current.vendor = parts[parts.length - 1] || "";
+        }
+      }
+      if (current) devices.push(current);
+    }
+  }
+  return devices;
+}
+
+function detectRP1210() {
+  const iniPath = "C:\\Windows\\RP121032.ini";
+  const devices = [];
+
+  try {
+    if (!fs.existsSync(iniPath)) return [];
+
+    const content = fs.readFileSync(iniPath, "utf8");
+    const lines = content.split(/\r?\n/);
+
+    for (const line of lines) {
+      if (line.toLowerCase().startsWith("apiimplementations")) {
+        const value = line.split("=")[1] || "";
+        value.split(",").map(x => x.trim()).filter(Boolean).forEach(name => {
+          devices.push({ name, type: "RP1210" });
+        });
+      }
+    }
+    return devices;
+  } catch (err) {
+    return [];
+  }
+}
+
+async function detectAllHardware() {
+  const serial = await listSerialPorts();
+  const usbDevices = listUsbDevices();
+  const drives = detectDrives();
+  const j2534 = await detectJ2534();
+  const rp1210 = detectRP1210();
+
+  return { serial, usb: usbDevices, drives, j2534, rp1210 };
+}
+
+function okBase() {
+  return {
+    ok: true,
+    detected: true,
+    bridge: "online",
+    software: "BrasilXMaster Bridge",
+    version: "1.0.0",
+    port: PORT
+  };
+}
+
+function startBridge() {
+  const api = express();
+
+  api.use(cors({
+    origin: "*",
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"]
+  }));
+
+  api.use(express.json({ limit: "50mb" }));
+
+  api.get("/", (req, res) => res.json(okBase()));
+  api.get("/detect", (req, res) => res.json({ ...okBase(), status: "online", site: SITE_URL }));
+  api.get("/health", (req, res) => res.json({ ...okBase(), status: "online" }));
+  api.get("/status", (req, res) => res.json({ ...okBase(), serialConnected: !!activePort, serialPath: activePort ? activePort.path : null }));
+  api.get("/ping", (req, res) => res.json({ ...okBase(), pong: true }));
+
+  api.get("/interfaces", async (req, res) => {
+    try {
+      const hw = await detectAllHardware();
+      res.json({ ...okBase(), ...hw });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  api.get("/hardware/list", async (req, res) => {
+    try {
+      res.json({ ...okBase(), hardware: await detectAllHardware() });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  api.get("/usb/list", async (req, res) => {
+    try {
+      res.json({ ...okBase(), usb: listUsbDevices() });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  api.get("/drives", (req, res) => res.json({ ...okBase(), drives: detectDrives() }));
+  api.get("/j2534", async (req, res) => {
+    try {
+      res.json({ ...okBase(), j2534: await detectJ2534() });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+  api.get("/rp1210", (req, res) => res.json({ ...okBase(), rp1210: detectRP1210() }));
+
+  api.get("/serial/list", async (req, res) => {
+    try {
+      res.json({ ...okBase(), serial: await listSerialPorts() });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  api.post("/serial/connect", async (req, res) => {
+    try {
+      const path = req.body.path || req.body.port || req.body.com;
+      const baudRate = Number(req.body.baudRate || 38400);
+
+      if (!path) {
+        return res.status(400).json({ ok: false, error: "Informe path, port ou com" });
+      }
+
+      if (activePort && activePort.isOpen) activePort.close();
+
+      activePort = new SerialPort({ path, baudRate, autoOpen: false });
+
+      activePort.open((err) => {
+        if (err) {
+          return res.status(500).json({ ok: false, error: err.message });
+        }
+        res.json({ ...okBase(), connected: true, path, baudRate });
+      });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  api.post("/serial/disconnect", (req, res) => {
+    try {
+      if (!activePort) {
+        return res.json({ ...okBase(), disconnected: true });
+      }
+      activePort.close(() => {
+        activePort = null;
+        res.json({ ...okBase(), disconnected: true });
+      });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  api.post("/serial/write", (req, res) => {
+    try {
+      if (!activePort || !activePort.isOpen) {
+        return res.status(400).json({ ok: false, error: "Serial nao conectada" });
+      }
+
+      const data = req.body.data || "";
+      const encoding = req.body.encoding || "hex";
+      let buffer = encoding === "hex" ? Buffer.from(String(data).replace(/\s/g, ""), "hex") : Buffer.from(String(data), "utf8");
+
+      activePort.write(buffer, (err) => {
+        if (err) {
+          return res.status(500).json({ ok: false, error: err.message });
+        }
+        res.json({ ...okBase(), written: buffer.length });
+      });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  api.get("/serial/status", (req, res) => {
+    res.json({ ...okBase(), connected: !!activePort, path: activePort ? activePort.path : null, isOpen: activePort ? activePort.isOpen : false });
+  });
+
+  api.post("/obd/connect", (req, res) => {
+    res.json({ ...okBase(), message: "OBD connect recebido", received: req.body || {} });
+  });
+
+  api.get("/obd/status", (req, res) => {
+    res.json({ ...okBase(), connected: !!activePort });
+  });
+
+  api.get("/dtc/read", (req, res) => {
+    res.json({ ...okBase(), dtcs: [], message: "Endpoint DTC online" });
+  });
+
+  api.post("/dtc/clear", (req, res) => {
+    res.json({ ...okBase(), cleared: false, message: "Endpoint clear DTC online" });
+  });
+
+  api.get("/live-data", (req, res) => {
+    res.json({ ...okBase(), data: [], message: "Endpoint live-data online" });
+  });
+
+  api.listen(PORT, () => {
+    console.log("BrasilXMaster Bridge online em http://localhost:" + PORT);
+  });
+}
+
+function createWindow() {
+  mainWindow = new BrowserWindow({
+    width: 1400,
+    height: 900,
+    title: "BrasilXMaster Bridge",
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true
+    }
+  });
+
+  mainWindow.maximize();
+  mainWindow.loadURL(SITE_URL);
+}
+
+const gotLock = app.requestSingleInstanceLock();
+
+if (!gotLock) {
+  app.quit();
+} else {
+  app.whenReady().then(() => {
+    startBridge();
+    createWindow();
+  });
+
+  app.on("second-instance", () => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
+    }
+  });
+
+  app.on("window-all-closed", () => {
+    if (process.platform !== "darwin") app.quit();
+  });
+}
+'@
+          $code | Out-File src/main.js -Encoding utf8
+
+      - name: Instalar dependências
+        run: npm install --no-audit --no-fund
+
+      - name: Build executável Windows
+        run: npm run build
+
+      - name: Compactar resultado
+        shell: powershell
+        run: |
+          if (Test-Path "dist") {
+            Compress-Archive -Path "dist/*" -DestinationPath BrasilXMaster-Bridge-Windows.zip -Force
+          } else {
+            Write-Error "Pasta dist nao encontrada"
+            exit 1
+          }
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: BrasilXMaster-Bridge-Windows
+          path: BrasilXMaster-Bridge-Windows.zip
+          retention-days: 30
