@@ -1,0 +1,45 @@
+{
+  "name": "brasilxmaster-bridge",
+  "version": "1.0.0",
+  "description": "BrasilXMaster Bridge - app Windows com localhost:9999",
+  "main": "src/main.js",
+  "author": "BrasilXMaster",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win nsis portable --x64"
+  },
+  "dependencies": {
+    "cors": "2.8.5",
+    "express": "4.18.3"
+  },
+  "devDependencies": {
+    "electron": "29.4.6",
+    "electron-builder": "24.13.3"
+  },
+  "build": {
+    "appId": "br.com.brasilxmaster.bridge",
+    "productName": "BrasilXMaster Bridge",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "src/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ],
+      "artifactName": "BrasilXMaster-Bridge-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "BrasilXMaster Bridge"
+    }
+  }
+}
