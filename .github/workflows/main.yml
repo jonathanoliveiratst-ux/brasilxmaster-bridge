@@ -8,375 +8,162 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - name: Criar projeto completo
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Criar estrutura do projeto
         shell: powershell
         run: |
           New-Item -ItemType Directory -Force src
-
-          @'
-          {
-            "name": "brasilxmaster-bridge",
-            "version": "1.0.0",
-            "main": "src/main.js",
-            "scripts": {
-              "pack": "electron-packager . BrasilXMaster-Bridge --platform=win32 --arch=x64 --out=release --overwrite"
-            },
-            "dependencies": {
-              "cors": "2.8.5",
-              "express": "4.18.3",
-              "electron": "29.4.6",
-              "serialport": "12.0.0",
-              "dotenv": "16.4.5"
-            },
-            "devDependencies": {
-              "electron-packager": "17.1.2"
+          
+          $package = @{
+            name = "brasilxmaster-bridge"
+            version = "1.0.0"
+            main = "src/main.js"
+            scripts = @{
+              pack = "electron-builder --win --publish never"
             }
-          }
-          '@ | Out-File package.json -Encoding utf8
-
-          @'
-          PORT=9999
-          SITE_URL=https://brasilxmaster.com.br
-          '@ | Out-File .env -Encoding utf8
-
-          @'
-          /* eslint-disable no-undef */
-
-          require("dotenv").config();
-
-          const { app, BrowserWindow } = require("electron");
-          const express = require("express");
-          const cors = require("cors");
-          const { SerialPort } = require("serialport");
-
-          const SITE_URL = process.env.SITE_URL || "https://brasilxmaster.com.br";
-          const PORT = Number(process.env.PORT || 9999);
-
-          let mainWindow = null;
-          let activePort = null;
-
-          async function listSerialPorts() {
-            try {
-              const ports = await SerialPort.list();
-              return ports.map(p => ({
-                path: p.path,
-                manufacturer: p.manufacturer || "",
-                serialNumber: p.serialNumber || "",
-                vendorId: p.vendorId || "",
-                productId: p.productId || "",
-                pnpId: p.pnpId || ""
-              }));
-            } catch (err) {
-              return [];
+            dependencies = @{
+              express = "^4.18.3"
+              cors = "^2.8.5"
+              serialport = "^9.2.8"
+              usb = "^1.11.0"
             }
-          }
+            devDependencies = @{
+              electron = "^27.0.0"
+              "electron-builder" = "^24.6.4"
+            }
+          } | ConvertTo-Json
+          $package | Out-File package.json -Encoding utf8
 
-          function startBridge() {
-            const api = express();
+      - name: Criar main.js
+        shell: powershell
+        run: |
+          $code = @'
+/* eslint-disable no-undef */
+const { app, BrowserWindow } = require("electron");
+const express = require("express");
+const cors = require("cors");
+const { SerialPort } = require("serialport");
+const usb = require("usb");
 
-            api.use(cors({
-              origin: "*",
-              methods: ["GET", "POST", "OPTIONS"],
-              allowedHeaders: ["Content-Type", "Authorization"]
-            }));
+const SITE_URL = "https://brasilxmaster.com.br";
+const PORT = 9999;
 
-            api.use(express.json({ limit: "50mb" }));
+async function discoverDevices() {
+  const devices = [];
+  try {
+    const ports = await SerialPort.list();
+    ports.forEach(port => {
+      devices.push({
+        type: "serial",
+        port: port.path,
+        manufacturer: port.manufacturer || "Unknown",
+        description: port.description || "Serial Port",
+        productId: port.productId,
+        vendorId: port.vendorId,
+        baudRate: 115200
+      });
+    });
+  } catch (err) {
+    console.error("Erro ao listar portas seriais:", err.message);
+  }
+  return devices;
+}
 
-            const baseStatus = () => ({
-              ok: true,
-              detected: true,
-              bridge: "online",
-              software: "BrasilXMaster Bridge",
-              version: "1.0.0",
-              port: PORT
-            });
+function startBridge() {
+  const api = express();
 
-            api.get("/", async (req, res) => {
-              try {
-                res.json(baseStatus());
-              } catch (err) {
-                res.status(500).json({ ok: false, error: err.message });
-              }
-            });
+  api.use(cors({
+    origin: "*",
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"]
+  }));
 
-            api.get("/detect", async (req, res) => {
-              try {
-                res.json({
-                  ...baseStatus(),
-                  status: "online",
-                  site: SITE_URL
-                });
-              } catch (err) {
-                res.status(500).json({ ok: false, error: err.message });
-              }
-            });
+  api.use(express.json());
 
-            api.get("/health", async (req, res) => {
-              try {
-                res.json({ ...baseStatus(), status: "online" });
-              } catch (err) {
-                res.status(500).json({ ok: false, error: err.message });
-              }
-            });
+  const status = {
+    ok: true,
+    detected: true,
+    connected: true,
+    software: "BrasilXMaster Bridge",
+    name: "BrasilXMaster Bridge",
+    version: "1.0.0",
+    status: "online",
+    port: PORT
+  };
 
-            api.get("/status", async (req, res) => {
-              try {
-                res.json({
-                  ...baseStatus(),
-                  serialConnected: !!activePort,
-                  serialPath: activePort ? activePort.path : null
-                });
-              } catch (err) {
-                res.status(500).json({ ok: false, error: err.message });
-              }
-            });
+  api.get("/", (req, res) => res.json(status));
+  api.get("/detect", (req, res) => res.json(status));
+  api.get("/health", (req, res) => res.json(status));
+  api.get("/status", (req, res) => res.json(status));
+  api.get("/ping", (req, res) => res.json(status));
 
-            api.get("/ping", async (req, res) => {
-              try {
-                res.json({ ...baseStatus(), pong: true });
-              } catch (err) {
-                res.status(500).json({ ok: false, error: err.message });
-              }
-            });
+  api.get("/interfaces", async (req, res) => {
+    const devices = await discoverDevices();
+    res.json({
+      ok: true,
+      detected: true,
+      software: "BrasilXMaster Bridge",
+      interfaces: devices,
+      message: "Bridge online em localhost:9999"
+    });
+  });
 
-            api.get("/interfaces", async (req, res) => {
-              try {
-                const serial = await listSerialPorts();
+  api.post("/hardware/connect", (req, res) => {
+    res.json({
+      ok: true,
+      detected: true,
+      message: "Comando recebido",
+      received: req.body
+    });
+  });
 
-                res.json({
-                  ok: true,
-                  bridge: "online",
-                  detected: true,
-                  serial,
-                  j2534: [],
-                  rp1210: [],
-                  usb: []
-                });
-              } catch (err) {
-                res.status(500).json({ ok: false, error: err.message });
-              }
-            });
+  api.listen(PORT, () => {
+    console.log("BrasilXMaster Bridge rodando na porta " + PORT);
+  });
+}
 
-            api.get("/serial/list", async (req, res) => {
-              try {
-                res.json({
-                  ok: true,
-                  serial: await listSerialPorts()
-                });
-              } catch (err) {
-                res.status(500).json({ ok: false, error: err.message });
-              }
-            });
+function createWindow() {
+  const win = new BrowserWindow({
+    width: 1400,
+    height: 900,
+    title: "BrasilXMaster Bridge"
+  });
 
-            api.post("/serial/connect", async (req, res) => {
-              try {
-                const path = req.body.path || req.body.port || req.body.com;
-                const baudRate = Number(req.body.baudRate || 38400);
+  win.maximize();
+  win.loadURL(SITE_URL);
+}
 
-                if (!path) {
-                  return res.status(400).json({ ok: false, error: "Informe path/port/com" });
-                }
+app.whenReady().then(() => {
+  startBridge();
+  createWindow();
+});
 
-                if (activePort && activePort.isOpen) {
-                  activePort.close();
-                }
+app.on("window-all-closed", () => {
+  app.quit();
+});
+'@
+          $code | Out-File src/main.js -Encoding utf8
 
-                activePort = new SerialPort({
-                  path,
-                  baudRate,
-                  autoOpen: false
-                });
-
-                activePort.open((err) => {
-                  if (err) {
-                    return res.status(500).json({ ok: false, error: err.message });
-                  }
-
-                  res.json({
-                    ok: true,
-                    connected: true,
-                    path,
-                    baudRate
-                  });
-                });
-              } catch (err) {
-                res.status(500).json({ ok: false, error: err.message });
-              }
-            });
-
-            api.post("/serial/disconnect", async (req, res) => {
-              try {
-                if (!activePort) {
-                  return res.json({ ok: true, disconnected: true, message: "Nenhuma porta ativa" });
-                }
-
-                activePort.close(() => {
-                  activePort = null;
-                  res.json({ ok: true, disconnected: true });
-                });
-              } catch (err) {
-                res.status(500).json({ ok: false, error: err.message });
-              }
-            });
-
-            api.post("/serial/write", async (req, res) => {
-              try {
-                if (!activePort || !activePort.isOpen) {
-                  return res.status(400).json({ ok: false, error: "Serial nao conectada" });
-                }
-
-                const data = req.body.data || "";
-                const encoding = req.body.encoding || "hex";
-
-                let buffer;
-
-                if (encoding === "hex") {
-                  buffer = Buffer.from(data.replace(/\s/g, ""), "hex");
-                } else {
-                  buffer = Buffer.from(String(data), "utf8");
-                }
-
-                activePort.write(buffer, (err) => {
-                  if (err) {
-                    return res.status(500).json({ ok: false, error: err.message });
-                  }
-
-                  res.json({ ok: true, written: buffer.length });
-                });
-              } catch (err) {
-                res.status(500).json({ ok: false, error: err.message });
-              }
-            });
-
-            api.get("/serial/status", async (req, res) => {
-              try {
-                res.json({
-                  ok: true,
-                  connected: !!activePort,
-                  path: activePort ? activePort.path : null,
-                  isOpen: activePort ? activePort.isOpen : false
-                });
-              } catch (err) {
-                res.status(500).json({ ok: false, error: err.message });
-              }
-            });
-
-            api.post("/obd/connect", async (req, res) => {
-              try {
-                res.json({
-                  ok: true,
-                  message: "OBD connect recebido",
-                  note: "Modulo OBD real sera ligado na serial/J2534/RP1210",
-                  received: req.body || {}
-                });
-              } catch (err) {
-                res.status(500).json({ ok: false, error: err.message });
-              }
-            });
-
-            api.get("/obd/status", async (req, res) => {
-              try {
-                res.json({
-                  ok: true,
-                  connected: !!activePort,
-                  bridge: "online"
-                });
-              } catch (err) {
-                res.status(500).json({ ok: false, error: err.message });
-              }
-            });
-
-            api.get("/dtc/read", async (req, res) => {
-              try {
-                res.json({
-                  ok: true,
-                  dtcs: [],
-                  message: "Endpoint DTC online. Leitura real depende do protocolo conectado."
-                });
-              } catch (err) {
-                res.status(500).json({ ok: false, error: err.message });
-              }
-            });
-
-            api.post("/dtc/clear", async (req, res) => {
-              try {
-                res.json({
-                  ok: true,
-                  cleared: false,
-                  message: "Endpoint clear DTC online. Acao real depende do protocolo conectado."
-                });
-              } catch (err) {
-                res.status(500).json({ ok: false, error: err.message });
-              }
-            });
-
-            api.get("/live-data", async (req, res) => {
-              try {
-                res.json({
-                  ok: true,
-                  data: [],
-                  message: "Endpoint live-data online. Dados reais dependem da interface conectada."
-                });
-              } catch (err) {
-                res.status(500).json({ ok: false, error: err.message });
-              }
-            });
-
-            api.listen(PORT, () => {
-              console.log("BrasilXMaster Bridge online em http://localhost:" + PORT);
-            });
-          }
-
-          function createWindow() {
-            mainWindow = new BrowserWindow({
-              width: 1400,
-              height: 900,
-              title: "BrasilXMaster Bridge",
-              webPreferences: {
-                nodeIntegration: false,
-                contextIsolation: true
-              }
-            });
-
-            mainWindow.maximize();
-            mainWindow.loadURL(SITE_URL);
-          }
-
-          const gotLock = app.requestSingleInstanceLock();
-
-          if (!gotLock) {
-            app.quit();
-          } else {
-            app.whenReady().then(() => {
-              startBridge();
-              createWindow();
-            });
-
-            app.on("second-instance", () => {
-              if (mainWindow) {
-                if (mainWindow.isMinimized()) mainWindow.restore();
-                mainWindow.focus();
-              }
-            });
-
-            app.on("window-all-closed", () => {
-              if (process.platform !== "darwin") app.quit();
-            });
-          }
-          '@ | Out-File src/main.js -Encoding utf8
-
-      - name: Instalar dependencias
+      - name: Instalar dependências
         run: npm install --no-audit --no-fund
 
-      - name: Gerar aplicativo Windows
+      - name: Gerar executável Windows
         run: npm run pack
 
       - name: Compactar resultado
         shell: powershell
-        run: Compress-Archive -Path release\* -DestinationPath BrasilXMaster-Bridge-Windows.zip
+        run: Compress-Archive -Path "dist/*" -DestinationPath BrasilXMaster-Bridge-Windows.zip -Force
 
-      - name: Enviar para download
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: BrasilXMaster-Bridge-Windows
           path: BrasilXMaster-Bridge-Windows.zip
+          retention-days: 30
